@@ -49,7 +49,7 @@ __all__ = [
 ]
 
 # 便捷函数
-def analyze_stock(symbol, period="1y", use_ai=False, ai_provider="deepseek"):
+def analyze_stock(symbol):
     """
     便捷函数：分析股票技术指标
 
