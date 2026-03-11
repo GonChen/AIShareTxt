@@ -54,23 +54,10 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Run tests
+      - name: Run regression tests
         run: |
-          # 运行基本导入测试
-          python -c "
-          try:
-              import AIShareTxt
-              print('Import successful')
-          except ImportError as e:
-              print(f'Import failed: {e}')
-              # 如果是TA-Lib相关错误，继续执行而不失败
-              if 'TA-Lib' in str(e):
-                  print('TA-Lib import failed, but continuing...')
-              else:
-                  raise
-          "
-          # 如果有测试文件，可以运行 pytest
-          # pytest
+          # 运行回归测试
+          python scripts/regression_test.py
 
   release-build:
     runs-on: ubuntu-latest
