@@ -368,6 +368,23 @@ flake8 AIShareTxt/
 pytest
 ```
 
+### 回归测试
+
+在提交代码前，请运行回归测试确保核心功能正常：
+
+```bash
+# 运行回归测试
+python scripts/regression_test.py
+```
+
+回归测试会验证以下核心入口：
+- `analyze_stock("000001")` - API 方式
+- `aishare 000001` - 命令行方式
+
+> 💡 **注意**：只有修改 `AIShareTxt/` 目录下的代码时才需要运行回归测试。文档、配置文件等修改不会触发测试。
+
+详细说明请查看：[回归测试使用指南](docs/regression-test-guide.md)
+
 ## 📈 使用示例
 
 ### 完整分析流程

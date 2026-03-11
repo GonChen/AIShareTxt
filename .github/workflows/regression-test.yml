@@ -4,8 +4,12 @@ name: Regression Test
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - 'AIShareTxt/**'
   push:
     branches: [main]
+    paths:
+      - 'AIShareTxt/**'
   workflow_dispatch:
 
 jobs:
