@@ -1,9 +1,11 @@
 name: Regression Test
 
-# 触发条件：PR 提交或手动运行
+# 触发条件：PR 提交、push 到 main、或手动运行
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
