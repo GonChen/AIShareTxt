@@ -1,204 +1,186 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-股票数据获取模块
-负责从各种数据源获取股票相关数据
+股票数据获取调度模块
+根据配置选择数据源，统一数据清洗流程
 """
 
-import akshare as ak
 import pandas as pd
-import numpy as np
 import pandas_market_calendars as mcal
-from typing import Optional, Union, cast
+from typing import Optional, cast
 from datetime import datetime, timedelta, time, date
 from ..core.config import IndicatorConfig as Config
 from ..utils.utils import LoggerManager
+from .data_sources import AkshareDataSource, create_gm_source
 import warnings
 warnings.filterwarnings('ignore')
 
 
 class StockDataFetcher:
-    """股票数据获取器"""
-    
+    """股票数据获取器（调度器）"""
+
     def __init__(self):
         self.config = Config()
         self.logger = LoggerManager.get_logger('data_fetcher')
-        # 获取上交所（SSE）日历
         self.sse_calendar = mcal.get_calendar('SSE')
-    
-    def _is_trading_day_and_not_closed(self) -> bool:
+
+        # 初始化数据源
+        self._akshare = AkshareDataSource()
+        self._primary = self._akshare
+
+        source_name = self.config.DATA_SOURCE_CONFIG.get('default_source', 'akshare')
+        if source_name == 'gm':
+            gm_token = self.config.DATA_SOURCE_CONFIG.get('gm', {}).get('token', '')
+            if gm_token:
+                try:
+                    self._primary = create_gm_source(self.config.DATA_SOURCE_CONFIG)
+                    self.logger.info("数据源已切换为 gm（掘金量化）")
+                except Exception as e:
+                    self.logger.warning(f"gm 数据源初始化失败，回退到 akshare：{str(e)}")
+                    self._primary = self._akshare
+            else:
+                self.logger.warning("gm 数据源未配置 GM_TOKEN，使用 akshare")
+
+    # ==================== 公开接口 ====================
+
+    def fetch_stock_data(self, stock_code: str, period: Optional[str] = None,
+                         adjust: Optional[str] = None, start_date: Optional[str] = None) -> Optional[pd.DataFrame]:
         """
-        判断今天是否是交易日且未收盘
+        获取股票历史价格数据
 
-        Returns:
-            bool: True表示今天是交易日且未收盘，False表示非交易日或已收盘
+        根据配置选择主数据源，失败后 fallback 到 akshare
         """
-        try:
-            now = datetime.now()
-            today = now.date()
-            current_time = now.time()
+        if period is None:
+            period = self.config.DATA_CONFIG['default_period']
+        if adjust is None:
+            adjust = self.config.DATA_CONFIG['default_adjust']
+        if start_date is None:
+            months_back = self.config.DATA_CONFIG.get('default_months_back', 4)
+            default_start = datetime.now() - timedelta(days=months_back * 30)
+            start_date = default_start.strftime('%Y%m%d')
 
-            # 首先使用 pandas_market_calendars 判断是否为交易日
-            is_trading_day = self._is_trading_day(today)
+        # 主数据源
+        raw_data = self._primary.fetch_stock_data(stock_code, period, start_date, adjust)
 
-            if not is_trading_day:
-                self.logger.debug(f"今天 {today} 不是交易日")
-                return False
+        # fallback 到 akshare
+        if (raw_data is None or (isinstance(raw_data, pd.DataFrame) and len(raw_data) == 0)):
+            if self._primary is not self._akshare:
+                self.logger.info("主数据源失败，fallback 到 akshare")
+                raw_data = self._akshare.fetch_stock_data(stock_code, period, start_date, adjust)
 
-            # 收盘时间：15:00
-            market_close = time(15, 0)
-
-            # 开盘时间：9:30
-            market_open = time(9, 25)
-            # 判断今天是否已开盘
-            is_market_opened = current_time >= market_open
-            # 如果今天未开盘，返回False
-            if not is_market_opened:
-                self.logger.debug(f"今天 {today} 还未开盘")
-                return False
-
-            # 判断今天是否已收盘
-            is_market_closed = current_time >= market_close 
-
-            self.logger.debug(f"当前时间: {now}")
-            self.logger.debug(f"是否为交易日: {is_trading_day}")
-            self.logger.debug(f"市场是否已开盘: {is_market_opened}")
-            self.logger.debug(f"市场是否已收盘: {is_market_closed}")
-
-            # 如果是交易日且已开盘但是未收盘，返回True
-            return not is_market_closed
-
-        except Exception as e:
-            self.logger.warning(f"判断交易时间时出错：{str(e)}")
-            # 如果无法判断，返回False（保守处理）
-            return False
-
-    def _get_nearest_trading_date(self, input_date: date) -> Optional[date]:
-        """
-        获取指定日期最近的交易日（向前查找）
-
-        如果输入日期是交易日，返回该日期；
-        如果输入日期不是交易日，返回之前的最近交易日。
-
-        Args:
-            input_date: 要检查的日期
-
-        Returns:
-            datetime.date: 最近的交易日，失败返回None
-        """
-        try:
-            # 获取日期前后的交易日历（扩大范围以确保能获取到数据）
-            start_date = input_date - timedelta(days=30)  # 往前30天
-            end_date = input_date + timedelta(days=7)     # 往后7天
-
-            schedule = self.sse_calendar.schedule(start_date=start_date, end_date=end_date)
-
-            if schedule.empty:
-                self.logger.debug(f"无法获取 {start_date} 到 {end_date} 的交易日历")
-                return self._fallback_nearest_trading_date(input_date)
-
-            # 获取所有交易日并排序
-            trading_days = sorted(schedule.index.date)
-
-            # 从后往前找第一个 <= input_date 的交易日
-            for trading_day in reversed(trading_days):
-                if trading_day <= input_date:
-                    self.logger.debug(f"日期 {input_date} 的最近交易日是 {trading_day}")
-                    return trading_day
-
-            # 如果没找到，返回最后一个交易日
-            if trading_days:
-                last_trading_day = trading_days[-1]
-                self.logger.debug(f"日期 {input_date} 超出范围，返回最后一个交易日 {last_trading_day}")
-                return last_trading_day
-
+        if raw_data is None or (isinstance(raw_data, pd.DataFrame) and len(raw_data) == 0):
+            self.logger.error(f"所有数据源均获取失败：{stock_code}")
             return None
 
-        except Exception as e:
-            self.logger.warning(f"使用pandas_market_calendars获取最近交易日失败：{str(e)}")
-            return self._fallback_nearest_trading_date(input_date)
+        return self._process_stock_data(raw_data, stock_code)
 
-    def _fallback_nearest_trading_date(self, input_date: date) -> Optional[date]:
-        """
-        备用的最近交易日获取方法（简单的周一到周五判断）
+    def get_fund_flow_data(self, stock_code, target_date=None):
+        """获取主力资金流数据"""
+        data = self._primary.get_fund_flow_data(stock_code, target_date)
 
-        Args:
-            input_date: 要检查的日期
+        if not data and self._primary is not self._akshare:
+            self.logger.info("主数据源资金流失败，fallback 到 akshare")
+            data = self._akshare.get_fund_flow_data(stock_code, target_date)
 
-        Returns:
-            datetime.date: 最近的交易日，失败返回None
-        """
+        return data
+
+    def get_stock_basic_info(self, stock_code):
+        """获取股票基本信息"""
+        info = self._primary.get_stock_basic_info(stock_code)
+
+        if (not info or info.get('股票简称') == '未知') and self._primary is not self._akshare:
+            self.logger.info("主数据源基本信息失败，fallback 到 akshare")
+            info = self._akshare.get_stock_basic_info(stock_code)
+
+        return info
+
+    # ==================== 共享数据清洗 ====================
+
+    def _process_stock_data(self, data: pd.DataFrame, stock_code: str) -> Optional[pd.DataFrame]:
+        """处理和清洗股票数据（所有数据源共享）"""
         try:
-            # 从输入日期开始向前查找
-            current_date = input_date
-            max_lookback = 7  # 最多往前查7天
+            if data is None or len(data) == 0:
+                self.logger.error(f"{self.config.ERROR_MESSAGES['no_data']}: {stock_code}")
+                return None
 
-            for _ in range(max_lookback):
-                weekday = current_date.weekday()
-                if weekday < 5:  # 0-4 是周一到周五
-                    self.logger.debug(f"使用备用方法：日期 {input_date} 的最近交易日是 {current_date}")
-                    return current_date
-                current_date = current_date - timedelta(days=1)
+            self.logger.debug(f"获取到数据，形状: {data.shape}")
 
-            # 如果7天内都是周末（理论上不可能），返回输入日期
-            self.logger.debug(f"备用方法未找到交易日，返回输入日期 {input_date}")
-            return input_date
+            # 标准化列名（如果数据源未做映射）
+            data = data.rename(columns=self.config.COLUMN_MAPPING)
+
+            # 检查必要的列是否存在
+            required_columns = self.config.DATA_CONFIG['required_columns']
+            missing_columns = [col for col in required_columns if col not in data.columns]
+
+            if missing_columns:
+                self.logger.error(f"数据缺少必要列 {missing_columns}")
+                return None
+
+            # 确保数据类型正确
+            for col in ['open', 'close', 'high', 'low', 'volume']:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+
+            # 删除包含NaN的行
+            data = data.dropna(subset=['open', 'close', 'high', 'low', 'volume'])
+
+            # 数据清洗：处理异常价格数据
+            original_len = len(data)
+
+            price_cols = ['open', 'close', 'high', 'low']
+            for col in price_cols:
+                mask = data[col] >= 0
+                data = cast(pd.DataFrame, data[mask].copy())
+
+            volume_mask = data['volume'] >= 0
+            data = cast(pd.DataFrame, data[volume_mask].copy())
+
+            high_low_mask = data['high'] >= data['low']
+            data = cast(pd.DataFrame, data[high_low_mask].copy())
+
+            close_range_mask = (data['close'] >= data['low']) & (data['close'] <= data['high'])
+            data = cast(pd.DataFrame, data[close_range_mask].copy())
+
+            open_range_mask = (data['open'] >= data['low']) & (data['open'] <= data['high'])
+            data = cast(pd.DataFrame, data[open_range_mask].copy())
+
+            cleaned_count = original_len - len(data)
+            if cleaned_count > 0:
+                self.logger.info(f"数据清洗：移除了 {cleaned_count} 条异常数据")
+
+            if len(data) == 0:
+                self.logger.error("数据清洗后为空")
+                return None
+
+            # 按日期排序
+            if not isinstance(data, pd.DataFrame):
+                self.logger.error("数据类型错误：期望DataFrame类型")
+                return None
+            data = data.sort_values('date').reset_index(drop=True)
+
+            # 检查并处理未收盘的不完整数据
+            original_length = len(data)
+            data = self._remove_incomplete_trading_data(data)
+
+            if len(data) == 0:
+                self.logger.error("处理后数据为空")
+                return None
+
+            self.logger.info(f"成功处理股票 {stock_code} 的数据，共 {len(data)} 条记录")
+            if original_length != len(data):
+                self.logger.info(f"已移除 {original_length - len(data)} 条不完整交易数据")
+
+            self.logger.debug(f"数据日期范围: {data['date'].iloc[0]} 到 {data['date'].iloc[-1]}")
+            self.logger.info(f"最新收盘价: {data['close'].iloc[-1]:.{self.config.DISPLAY_PRECISION['price']}f}")
+
+            return data
 
         except Exception as e:
-            self.logger.warning(f"备用方法获取最近交易日失败：{str(e)}")
+            self.logger.error(f"处理股票数据时出错：{str(e)}")
             return None
-
-    def _is_trading_day(self, date_to_check) -> bool:
-        """
-        判断指定日期是否为交易日
-
-        通过获取最近交易日，判断其是否等于输入日期来判定。
-
-        Args:
-            date_to_check: 要检查的日期
-
-        Returns:
-            bool: True表示是交易日，False表示非交易日
-        """
-        try:
-            # 获取最近的交易日
-            nearest_trading_date = self._get_nearest_trading_date(date_to_check)
-
-            if nearest_trading_date is None:
-                self.logger.debug(f"无法获取 {date_to_check} 的最近交易日")
-                return False
-
-            # 如果最近交易日等于输入日期，说明是交易日
-            is_trading = nearest_trading_date == date_to_check
-
-            self.logger.debug(f"使用日历检查 {date_to_check}: {'是交易日' if is_trading else '非交易日'}")
-            return is_trading
-
-        except Exception as e:
-            self.logger.warning(f"判断交易日失败：{str(e)}")
-            # 降级到简单的周一到周五判断
-            weekday = date_to_check.weekday()
-            is_trading = weekday < 5
-            self.logger.debug(f"使用备用方法检查 {date_to_check}: {'是交易日' if is_trading else '非交易日'}")
-            return is_trading
 
     def _remove_incomplete_trading_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        如果今天是交易日且未收盘，且最后一行数据是今天的，移除它
-
-        修复说明：
-        - 东方财富API在盘中会返回当天不完整数据，需要移除
-        - 新浪/腾讯API在盘中不返回当天数据，最新数据是上一个交易日
-        - 因此必须先检查最后一行是否是今天，再决定是否移除
-
-        Args:
-            data: 股票数据DataFrame
-
-        Returns:
-            处理后的DataFrame
-        """
+        """如果今天是交易日且未收盘，移除最后一行当天数据"""
         if self._is_trading_day_and_not_closed():
-            # 检查最后一行是否是今天的数据
             if len(data) > 0:
                 last_date = data['date'].iloc[-1]
                 if hasattr(last_date, 'date'):
@@ -219,755 +201,99 @@ class StockDataFetcher:
 
         return data
 
-    def _add_stock_prefix(self, stock_code: str) -> str:
-        """
-        为股票代码添加市场前缀
+    # ==================== 交易日判断 ====================
 
-        Args:
-            stock_code (str): 6位股票代码，如 '000001'
-
-        Returns:
-            str: 带前缀的股票代码，如 'sz000001' 或 'sh600000'
-        """
-        if stock_code.startswith('6'):
-            return f'sh{stock_code}'
-        else:
-            return f'sz{stock_code}'
-    
-    def _process_stock_data(self, data: pd.DataFrame, stock_code: str) -> Optional[pd.DataFrame]:
-        """
-        处理和清洗股票数据
-        
-        Args:
-            data: 原始股票数据
-            stock_code: 股票代码
-            
-        Returns:
-            处理后的数据或None
-        """
+    def _is_trading_day_and_not_closed(self) -> bool:
+        """判断今天是否是交易日且未收盘"""
         try:
-            if data is None or len(data) == 0:
-                self.logger.error(f"{self.config.ERROR_MESSAGES['no_data']}: {stock_code}")
-                return None
-            
-            self.logger.debug(f"获取到数据，形状: {data.shape}")
-            
-            # 标准化列名
-            data = data.rename(columns=self.config.COLUMN_MAPPING)
-            
-            # 检查必要的列是否存在
-            required_columns = self.config.DATA_CONFIG['required_columns']
-            missing_columns = [col for col in required_columns if col not in data.columns]
-            
-            if missing_columns:
-                self.logger.error(f"数据缺少必要列 {missing_columns}")
-                return None
-            
-            # 确保数据类型正确
-            for col in ['open', 'close', 'high', 'low', 'volume']:
-                data[col] = pd.to_numeric(data[col], errors='coerce')
-            
-            # 删除包含NaN的行
-            data = data.dropna(subset=['open', 'close', 'high', 'low', 'volume'])
-            
-            # 数据清洗：处理异常价格数据
-            original_len = len(data)
-            
-            # 删除价格为负数的行
-            price_cols = ['open', 'close', 'high', 'low']
-            for col in price_cols:
-                mask = data[col] >= 0
-                data = cast(pd.DataFrame, data[mask].copy())
-            
-            # 删除成交量为负数的行
-            volume_mask = data['volume'] >= 0
-            data = cast(pd.DataFrame, data[volume_mask].copy())
-            
-            # 删除价格逻辑错误的行（最高价小于最低价等）
-            high_low_mask = data['high'] >= data['low']
-            data = cast(pd.DataFrame, data[high_low_mask].copy())
-            
-            close_range_mask = (data['close'] >= data['low']) & (data['close'] <= data['high'])
-            data = cast(pd.DataFrame, data[close_range_mask].copy())
-            
-            open_range_mask = (data['open'] >= data['low']) & (data['open'] <= data['high'])
-            data = cast(pd.DataFrame, data[open_range_mask].copy())
-            
-            cleaned_count = original_len - len(data)
-            if cleaned_count > 0:
-                self.logger.info(f"数据清洗：移除了 {cleaned_count} 条异常数据")
-            
-            if len(data) == 0:
-                self.logger.error("数据清洗后为空")
-                return None
-            
-            # 按日期排序
-            if not isinstance(data, pd.DataFrame):
-                self.logger.error("数据类型错误：期望DataFrame类型")
-                return None
-            data = data.sort_values('date').reset_index(drop=True)
+            now = datetime.now()
+            today = now.date()
+            current_time = now.time()
 
-            # 检查并处理未收盘的不完整数据
-            original_length = len(data)
-            data = self._remove_incomplete_trading_data(data)
+            is_trading_day = self._is_trading_day(today)
+            if not is_trading_day:
+                self.logger.debug(f"今天 {today} 不是交易日")
+                return False
 
-            if len(data) == 0:
-                self.logger.error("处理后数据为空")
-                return None
+            market_open = time(9, 25)
+            is_market_opened = current_time >= market_open
+            if not is_market_opened:
+                self.logger.debug(f"今天 {today} 还未开盘")
+                return False
 
-            self.logger.info(f"✓ 成功处理股票 {stock_code} 的数据，共 {len(data)} 条记录")
-            if original_length != len(data):
-                self.logger.info(f"已移除 {original_length - len(data)} 条不完整交易数据")
+            market_close = time(15, 0)
+            is_market_closed = current_time >= market_close
 
-            self.logger.debug(f"数据日期范围: {data['date'].iloc[0]} 到 {data['date'].iloc[-1]}")
-            self.logger.info(f"最新收盘价: {data['close'].iloc[-1]:.{self.config.DISPLAY_PRECISION['price']}f}")
+            self.logger.debug(f"当前时间: {now}, 交易日: {is_trading_day}, 已开盘: {is_market_opened}, 已收盘: {is_market_closed}")
+            return not is_market_closed
 
-            return data
-            
         except Exception as e:
-            self.logger.error(f"处理股票数据时出错：{str(e)}")
+            self.logger.warning(f"判断交易时间时出错：{str(e)}")
+            return False
+
+    def _get_nearest_trading_date(self, input_date: date) -> Optional[date]:
+        """获取指定日期最近的交易日（向前查找）"""
+        try:
+            start_date = input_date - timedelta(days=30)
+            end_date = input_date + timedelta(days=7)
+
+            schedule = self.sse_calendar.schedule(start_date=start_date, end_date=end_date)
+
+            if schedule.empty:
+                self.logger.debug(f"无法获取 {start_date} 到 {end_date} 的交易日历")
+                return self._fallback_nearest_trading_date(input_date)
+
+            trading_days = sorted(schedule.index.date)
+
+            for trading_day in reversed(trading_days):
+                if trading_day <= input_date:
+                    self.logger.debug(f"日期 {input_date} 的最近交易日是 {trading_day}")
+                    return trading_day
+
+            if trading_days:
+                last_trading_day = trading_days[-1]
+                self.logger.debug(f"日期 {input_date} 超出范围，返回最后一个交易日 {last_trading_day}")
+                return last_trading_day
+
             return None
-    
-    def _fetch_from_default_api(self, stock_code: str, period: str, start_date: str, adjust: str) -> Optional[pd.DataFrame]:
-        """
-        从默认API获取数据（东方财富）
-        
-        Args:
-            stock_code: 股票代码
-            period: 周期
-            start_date: 开始日期
-            adjust: 复权类型
-            
-        Returns:
-            原始数据或None
-        """
-        try:
-            self.logger.info(f"[方法1] 尝试从东方财富获取股票 {stock_code} 的数据（从 {start_date} 开始）...")
-            raw_data = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period=cast(str, period),
-                start_date=start_date,
-                adjust=cast(str, adjust)
-            )
 
-            # 对成交量列需要进行数量转换*100，从手转换为股
-            if '成交量' in raw_data.columns:
-                raw_data['成交量'] *= 100
-            
-            return cast(pd.DataFrame, raw_data)
         except Exception as e:
-            self.logger.warning(f"[方法1] 东方财富API获取失败：{str(e)}")
+            self.logger.warning(f"使用pandas_market_calendars获取最近交易日失败：{str(e)}")
+            return self._fallback_nearest_trading_date(input_date)
+
+    def _fallback_nearest_trading_date(self, input_date: date) -> Optional[date]:
+        """备用的最近交易日获取方法"""
+        try:
+            current_date = input_date
+            max_lookback = 7
+
+            for _ in range(max_lookback):
+                weekday = current_date.weekday()
+                if weekday < 5:
+                    self.logger.debug(f"使用备用方法：日期 {input_date} 的最近交易日是 {current_date}")
+                    return current_date
+                current_date = current_date - timedelta(days=1)
+
+            self.logger.debug(f"备用方法未找到交易日，返回输入日期 {input_date}")
+            return input_date
+
+        except Exception as e:
+            self.logger.warning(f"备用方法获取最近交易日失败：{str(e)}")
             return None
-    
-    def _fetch_from_sina_api(self, stock_code: str, start_date: str, adjust: str) -> Optional[pd.DataFrame]:
-        """
-        从新浪API获取数据（备用方案1）
-        
-        Args:
-            stock_code: 股票代码
-            start_date: 开始日期
-            adjust: 复权类型
-            
-        Returns:
-            原始数据或None
-        """
+
+    def _is_trading_day(self, date_to_check) -> bool:
+        """判断指定日期是否为交易日"""
         try:
-            stock_code_with_prefix = self._add_stock_prefix(stock_code)
-            end_date = datetime.now().strftime('%Y%m%d')
-            
-            self.logger.info(f"[方法2] 尝试从新浪获取股票 {stock_code_with_prefix} 的数据...")
-            raw_data = ak.stock_zh_a_daily(
-                symbol=stock_code_with_prefix,
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust
-            )
-
-            # 新浪API现在返回的列名：
-            # - amount: 成交金额（元）→ 应映射为 turnover
-            # - turnover: 换手率（小数格式，0.2317 = 23.17%）→ 应转换为百分比后映射为 turnover_rate
-            # 注意：必须先处理 turnover 列，避免 amount 覆盖它
-            if 'turnover' in raw_data.columns:
-                # 新浪API的换手率是小数格式，需要转换为百分比（与东方财富保持一致）
-                raw_data['turnover'] = raw_data['turnover'] * 100
-                raw_data.rename(columns={'turnover': 'turnover_rate'}, inplace=True)
-            if 'amount' in raw_data.columns:
-                raw_data.rename(columns={'amount': 'turnover'}, inplace=True)
-
-            return cast(pd.DataFrame, raw_data)
+            nearest_trading_date = self._get_nearest_trading_date(date_to_check)
+            if nearest_trading_date is None:
+                self.logger.debug(f"无法获取 {date_to_check} 的最近交易日")
+                return False
+            is_trading = nearest_trading_date == date_to_check
+            self.logger.debug(f"使用日历检查 {date_to_check}: {'是交易日' if is_trading else '非交易日'}")
+            return is_trading
         except Exception as e:
-            self.logger.warning(f"[方法2] 新浪API获取失败：{str(e)}")
-            return None
-    
-    def _fetch_from_tencent_api(self, stock_code: str, start_date: str, adjust: str) -> Optional[pd.DataFrame]:
-        """
-        从腾讯API获取数据（备用方案2）
-        
-        Args:
-            stock_code: 股票代码
-            start_date: 开始日期
-            adjust: 复权类型
-            
-        Returns:
-            原始数据或None
-        """
-        try:
-            stock_code_with_prefix = self._add_stock_prefix(stock_code)
-            end_date = datetime.now().strftime('%Y%m%d')
-            
-            self.logger.info(f"[方法3] 尝试从腾讯获取股票 {stock_code_with_prefix} 的数据...")
-            raw_data = ak.stock_zh_a_hist_tx(
-                symbol=stock_code_with_prefix,
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust
-            )
-            
-            # 对成交量列需要进行数量转换*100，从手转换为股，并且列名从amount改为volume
-            if 'amount' in raw_data.columns:
-                raw_data['volume'] = raw_data['amount'] * 100
-                # 移除原始amount列
-                raw_data.drop(columns=['amount'], inplace=True)
-            
-            return cast(pd.DataFrame, raw_data)
-        except Exception as e:
-            self.logger.warning(f"[方法3] 腾讯API获取失败：{str(e)}")
-            return None
-    
-    def fetch_stock_data(self, stock_code: str, period: Optional[str] = None, adjust: Optional[str] = None, start_date: Optional[str] = None) -> Optional[pd.DataFrame]:
-        """
-        获取股票历史价格数据（支持多数据源备用方案）
-        
-        Args:
-            stock_code (str): 股票代码，如 '000001'
-            period (str): 周期，默认为 'daily'
-            adjust (str): 复权类型，默认为 'qfq'
-            start_date (str): 开始日期，如 '20230101',默认为当前时间往前推4个月
-        
-        Returns:
-            pd.DataFrame or None: 股票数据DataFrame,失败返回None
-        """
-        if period is None:
-            period = self.config.DATA_CONFIG['default_period']
-        if adjust is None:
-            adjust = self.config.DATA_CONFIG['default_adjust']
-        
-        # 如果没有指定开始日期，默认为当前时间往前推配置的月数
-        if start_date is None:
-            months_back = self.config.DATA_CONFIG.get('default_months_back', 4)
-            default_start = datetime.now() - timedelta(days=months_back * 30)  # 每月按30天计算
-            start_date = default_start.strftime('%Y%m%d')
-        
-        # 尝试多个数据源
-        raw_data = None
-        
-        # 方法1：东方财富（默认）
-        raw_data = self._fetch_from_default_api(stock_code, cast(str, period), start_date, cast(str, adjust))
-        
-        # 方法2：新浪（备用1）
-        if raw_data is None or len(raw_data) == 0:
-            self.logger.info("尝试使用备用方案1：新浪数据源")
-            raw_data = self._fetch_from_sina_api(stock_code, start_date, cast(str, adjust))
-        
-        # 方法3：腾讯（备用2）
-        if raw_data is None or len(raw_data) == 0:
-            self.logger.info("尝试使用备用方案2：腾讯数据源")
-            raw_data = self._fetch_from_tencent_api(stock_code, start_date, cast(str, adjust))
-        
-        # 如果所有方法都失败
-        if raw_data is None or len(raw_data) == 0:
-            self.logger.error(f"所有数据源均获取失败：{stock_code}")
-            self.logger.info("可能的原因：")
-            self.logger.info("1. 股票代码格式错误（请确保是6位数字，如 000001）")
-            self.logger.info("2. 网络连接问题")
-            self.logger.info("3. 所有数据源API暂时不可用")
-            self.logger.info("4. 股票代码不存在或已退市")
-            return None
-        
-
-        
-        # 处理数据
-        return self._process_stock_data(raw_data, stock_code)
-    
-    def get_fund_flow_data(self, stock_code, target_date=None):
-        """
-        获取主力资金流数据
-
-        Args:
-            stock_code (str): 股票代码
-            target_date (datetime.date, optional): 目标日期。如果指定，将获取该日期的资金流数据。
-                                                  如果不指定，获取最新一天的数据。
-
-        Returns:
-            dict: 资金流数据字典
-
-        Note:
-            如果指定了 target_date，会优先获取该日期的数据，确保与股票数据日期一致。
-        """
-        try:
-            self.logger.info("正在获取主力资金流数据...")
-
-            fund_flow_data = {}
-
-            # 获取个股资金流数据
-            try:
-                # 根据股票代码判断市场
-                market = self._determine_market(stock_code)
-                fund_df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
-
-                if fund_df is not None and len(fund_df) > 0:
-                    # 如果指定了目标日期，筛选该日期的数据
-                    if target_date is not None:
-                        # 统一日期格式进行比较
-                        matched_row = None
-                        for idx, row in fund_df.iterrows():
-                            row_date = row.get('日期')
-                            # 处理不同的日期格式
-                            if hasattr(row_date, 'date'):
-                                row_date = row_date.date()
-                            elif isinstance(row_date, str):
-                                try:
-                                    row_date = datetime.strptime(row_date, '%Y-%m-%d').date()
-                                except:
-                                    continue
-
-                            # 比较日期
-                            if row_date == target_date:
-                                matched_row = row
-                                self.logger.info(f"找到目标日期 {target_date} 的资金流数据")
-                                break
-
-                        # 如果没找到精确匹配，使用最接近的日期（<= target_date）
-                        if matched_row is None:
-                            self.logger.warning(f"未找到目标日期 {target_date} 的资金流数据，使用最接近的日期")
-                            # 从后往前找第一个 <= target_date 的数据
-                            for idx in range(len(fund_df) - 1, -1, -1):
-                                row = fund_df.iloc[idx]
-                                row_date = row.get('日期')
-                                if hasattr(row_date, 'date'):
-                                    row_date = row_date.date()
-                                elif isinstance(row_date, str):
-                                    try:
-                                        row_date = datetime.strptime(row_date, '%Y-%m-%d').date()
-                                    except:
-                                        continue
-
-                                if row_date <= target_date:
-                                    matched_row = row
-                                    self.logger.info(f"使用最接近日期 {row_date} 的资金流数据")
-                                    break
-
-                        if matched_row is not None:
-                            latest_row = matched_row
-                        else:
-                            # 如果都没找到，使用最早一天的数据（降级策略）
-                            earliest_row = fund_df.iloc[0]
-                            earliest_date = earliest_row.get('日期')
-                            if hasattr(earliest_date, 'date'):
-                                earliest_date = earliest_date.date()
-                            elif isinstance(earliest_date, str):
-                                try:
-                                    earliest_date = datetime.strptime(earliest_date, '%Y-%m-%d').date()
-                                except:
-                                    earliest_date = "未知"
-                            latest_row = earliest_row
-                            self.logger.warning(f"未找到 <= {target_date} 的资金流数据，使用最早可用日期 {earliest_date}")
-                    else:
-                        # 没有指定目标日期，获取最新一天的数据
-                        latest_row = fund_df.iloc[-1]
-
-                    # 解析资金流数据
-                    fund_flow_data = self._parse_fund_flow_data(latest_row)
-
-                    # 计算5日累计数据
-                    if len(fund_df) >= 5:
-                        fund_flow_data.update(self._calculate_5day_fund_flow(fund_df))
-
-                    self.logger.info("✓ 主力资金流数据获取成功")
-                    self.logger.debug(f"资金流数据范围: {fund_df.iloc[0].get('日期', 'N/A')} 到 {fund_df.iloc[-1].get('日期', 'N/A')}")
-
-            except Exception as e:
-                self.logger.warning(f"获取个股资金流数据失败：{str(e)}")
-
-            # 数据清洗和格式化
-            fund_flow_data = self._clean_fund_flow_data(fund_flow_data)
-
-            return fund_flow_data
-
-        except Exception as e:
-            self.logger.error(f"获取主力资金流数据失败：{str(e)}")
-            return {}
-    
-    def get_stock_basic_info(self, stock_code):
-        """
-        获取股票基本信息（支持降级机制）
-
-        降级策略：
-        1. 优先使用 akshare.stock_individual_info_em (东方财富 API)
-        2. 失败后降级到雪球 API 组合 (stock_individual_basic_info_xq + stock_individual_spot_xq)
-        3. 最终降级到默认值
-
-        Args:
-            stock_code (str): 股票代码
-
-        Returns:
-            dict: 股票基本信息字典
-        """
-        # 方案1: 尝试使用东方财富 API (原方案)
-        self.logger.info("正在获取股票基本信息...")
-        try:
-            df = ak.stock_individual_info_em(symbol=stock_code)
-            info_dict = {}
-            for i, row in df.iterrows():
-                key = str(row.iloc[0]).strip()
-                value = str(row.iloc[1]).strip()
-                info_dict[key] = value
-            stock_info = self._parse_basic_info(info_dict, stock_code)
-            stock_info = self._format_market_values(stock_info)
-            self.logger.info("✓ 股票基本信息获取成功（东方财富 API）")
-            return stock_info
-        except Exception as e:
-            self.logger.warning(f"东方财富 API 失败：{str(e)}")
-
-        # 方案2: 降级到雪球 API 组合
-        self.logger.info("尝试降级方案：雪球 API 组合...")
-        try:
-            stock_info = self._get_stock_basic_info_from_xq(stock_code)
-            if stock_info and stock_info.get('股票简称') != '未知':
-                self.logger.info("✓ 股票基本信息获取成功（雪球 API 降级）")
-                return stock_info
-        except Exception as e:
-            self.logger.warning(f"雪球 API 降级失败：{str(e)}")
-
-        # 方案3: 最终降级到默认值
-        self.logger.warning("所有数据源均失败，返回默认值")
-        return self._get_default_basic_info(stock_code)
-
-    def _get_stock_basic_info_from_xq(self, stock_code):
-        """
-        从雪球 API 获取股票基本信息（降级方案）
-
-        使用 stock_individual_basic_info_xq + stock_individual_spot_xq 组合获取数据
-
-        Args:
-            stock_code (str): 股票代码（6位数字）
-
-        Returns:
-            dict: 股票基本信息字典
-        """
-        # 转换代码格式：6xxx→SH, 0/3xxx→SZ
-        if stock_code.startswith('6'):
-            xq_code = f'SH{stock_code}'
-        else:
-            xq_code = f'SZ{stock_code}'
-
-        # API1: 获取基本信息（股票简称、行业）
-        basic_info = self._get_xq_basic_info(xq_code)
-
-        # API2: 获取实时行情（市值、市盈率等）
-        spot_info = self._get_xq_spot_info(xq_code)
-
-        # 合并数据
-        stock_info = {
-            '股票代码': stock_code,
-            '股票简称': basic_info.get('股票简称', '未知'),
-            '行业': basic_info.get('行业', '未知'),
-            '总市值': spot_info.get('总市值', 0),
-            '流通市值': spot_info.get('流通市值', 0),
-            '总股本': spot_info.get('流通股', 0),  # 雪球只有流通股
-            '流通股本': spot_info.get('流通股', 0),
-            '市盈率': spot_info.get('市盈率', '未知'),
-            '市净率': spot_info.get('市净率', '未知'),
-            '当前价格': spot_info.get('现价', 0),
-        }
-
-        # 格式化市值数据（转换为亿为单位）
-        stock_info = self._format_market_values(stock_info)
-
-        return stock_info
-
-    def _get_xq_basic_info(self, xq_code):
-        """从雪球获取基本信息（股票简称、行业）
-
-        支持代理错误自动重试：
-        - 检测到代理错误时自动禁用代理并重试
-        - 检测到KeyError 'data'时提示可能是IP限流
-        """
-        import pandas as pd
-        import requests
-        import os
-
-        # 定义可能需要重试的异常类型
-        retry_exceptions = (
-            requests.exceptions.ProxyError,
-            requests.exceptions.SSLError,
-            KeyError,  # 雪球API返回403时的KeyError: 'data'
-            requests.exceptions.ConnectionError,
-        )
-
-        for attempt in range(2):  # 最多尝试2次
-            try:
-                # 第一次尝试可能使用系统代理，第二次禁用代理
-                if attempt == 1:
-                    self.logger.info("检测到代理错误，尝试禁用代理后重试...")
-                    # 临时设置会话不使用代理
-                    import akshare.stock.cons as cons
-                    original_session = getattr(cons, '_session', None)
-                    # 创建新的无代理会话
-                    session = requests.Session()
-                    session.trust_env = False  # 禁用系统代理
-                    session.proxies = {'http': None, 'https': None}
-                    # 临时修改requests的默认行为
-                    original_get = requests.get
-                    requests.get = lambda *args, **kwargs: original_get(
-                        *args, proxies={'http': None, 'https': None}, **kwargs
-                    )
-
-                try:
-                    df = ak.stock_individual_basic_info_xq(symbol=xq_code)
-
-                    # 获取股票简称
-                    name = '未知'
-                    name_row = df[df['item'] == 'org_short_name_cn']
-                    if not name_row.empty:
-                        val = name_row.iloc[0]['value']
-                        if pd.notna(val) and val:
-                            name = val
-
-                    # 获取行业
-                    industry = '未知'
-                    industry_row = df[df['item'] == 'affiliate_industry']
-                    if not industry_row.empty:
-                        val = industry_row.iloc[0]['value']
-                        if isinstance(val, dict) and 'ind_name' in val:
-                            industry = val['ind_name']
-
-                    return {'股票简称': name, '行业': industry}
-
-                finally:
-                    # 恢复原始的requests.get
-                    if attempt == 1:
-                        requests.get = original_get
-
-            except retry_exceptions as e:
-                if attempt == 0:
-                    # 第一次失败，记录日志并准备重试
-                    if isinstance(e, KeyError):
-                        self.logger.warning(f"雪球API返回格式异常(KeyError): {str(e)}")
-                        self.logger.info("可能原因: IP被限流(403)、代理设置问题、或API返回格式变化")
-                    else:
-                        self.logger.warning(f"雪球API请求失败(可能是代理问题): {type(e).__name__}: {str(e)}")
-                else:
-                    # 第二次也失败，抛出异常
-                    self.logger.error(f"雪球API重试后仍然失败: {type(e).__name__}: {str(e)}")
-                    self.logger.error("建议: 1)检查网络连接 2)检查系统代理设置 3)稍后重试")
-                    raise
-
-            except Exception as e:
-                # 其他异常不重试，直接抛出
-                self.logger.error(f"雪球API获取基本信息时发生未预期错误: {type(e).__name__}: {str(e)}")
-                raise
-
-    def _get_xq_spot_info(self, xq_code):
-        """从雪球获取实时行情（市值、市盈率等）
-
-        支持代理错误自动重试：
-        - 检测到代理错误时自动禁用代理并重试
-        - 检测到KeyError 'data'时提示可能是IP限流
-        """
-        import requests
-        import pandas as pd
-
-        # 定义可能需要重试的异常类型
-        retry_exceptions = (
-            requests.exceptions.ProxyError,
-            requests.exceptions.SSLError,
-            KeyError,  # 雪球API返回403时的KeyError: 'data'
-            requests.exceptions.ConnectionError,
-        )
-
-        for attempt in range(2):  # 最多尝试2次
-            try:
-                # 第一次尝试可能使用系统代理，第二次禁用代理
-                if attempt == 1:
-                    self.logger.info("检测到代理错误，尝试禁用代理后重试...")
-                    # 临时禁用代理
-                    original_get = requests.get
-                    requests.get = lambda *args, **kwargs: original_get(
-                        *args, proxies={'http': None, 'https': None}, **kwargs
-                    )
-
-                try:
-                    df = ak.stock_individual_spot_xq(symbol=xq_code)
-                    data_dict = dict(zip(df['item'], df['value']))
-
-                    # 提取市值相关数据
-                    total_market_cap = self._safe_float_conversion(data_dict.get('资产净值/总市值', 0))
-                    float_market_cap = self._safe_float_conversion(data_dict.get('流通值', 0))
-                    float_shares = self._safe_float_conversion(data_dict.get('流通股', 0))
-
-                    # 提取估值指标
-                    pe_ratio = data_dict.get('市盈率(TTM)', '未知')
-                    pb_ratio = data_dict.get('市净率', '未知')
-
-                    # 提取当前价格
-                    current_price = self._safe_float_conversion(data_dict.get('现价', 0))
-
-                    return {
-                        '总市值': total_market_cap,
-                        '流通市值': float_market_cap,
-                        '流通股': float_shares,
-                        '市盈率': pe_ratio,
-                        '市净率': pb_ratio,
-                        '现价': current_price,
-                    }
-
-                finally:
-                    # 恢复原始的requests.get
-                    if attempt == 1:
-                        requests.get = original_get
-
-            except retry_exceptions as e:
-                if attempt == 0:
-                    # 第一次失败，记录日志并准备重试
-                    if isinstance(e, KeyError):
-                        self.logger.warning(f"雪球API返回格式异常(KeyError): {str(e)}")
-                        self.logger.info("可能原因: IP被限流(403)、代理设置问题、或API返回格式变化")
-                    else:
-                        self.logger.warning(f"雪球API请求失败(可能是代理问题): {type(e).__name__}: {str(e)}")
-                else:
-                    # 第二次也失败，抛出异常
-                    self.logger.error(f"雪球API重试后仍然失败: {type(e).__name__}: {str(e)}")
-                    self.logger.error("建议: 1)检查网络连接 2)检查系统代理设置 3)稍后重试")
-                    raise
-
-            except Exception as e:
-                # 其他异常不重试，直接抛出
-                self.logger.error(f"雪球API获取实时行情时发生未预期错误: {type(e).__name__}: {str(e)}")
-                raise
-    
-    def _determine_market(self, stock_code):
-        """根据股票代码判断市场"""
-        first_digit = stock_code[0]
-        return self.config.MARKET_MAPPING.get(first_digit, 'sz')
-    
-    def _parse_fund_flow_data(self, latest_row):
-        """解析资金流数据"""
-        # 处理日期字段，确保为字符串格式
-        date_value = latest_row.get('日期', '')
-        if hasattr(date_value, 'strftime'):
-            date_str = date_value.strftime('%Y-%m-%d')
-        else:
-            date_str = str(date_value)
-            
-        return {
-            '日期': date_str,
-            '主力净流入额': latest_row.get('主力净流入-净额', 0),
-            '主力净流入占比': latest_row.get('主力净流入-净占比', 0),
-            '超大单净流入额': latest_row.get('超大单净流入-净额', 0),
-            '超大单净流入占比': latest_row.get('超大单净流入-净占比', 0),
-            '大单净流入额': latest_row.get('大单净流入-净额', 0),
-            '大单净流入占比': latest_row.get('大单净流入-净占比', 0),
-            '中单净流入额': latest_row.get('中单净流入-净额', 0),
-            '中单净流入占比': latest_row.get('中单净流入-净占比', 0),
-            '小单净流入额': latest_row.get('小单净流入-净额', 0),
-            '小单净流入占比': latest_row.get('小单净流入-净占比', 0),
-            '收盘价': latest_row.get('收盘价', 0),
-            '涨跌幅': latest_row.get('涨跌幅', 0)
-        }
-    
-    def _calculate_5day_fund_flow(self, fund_df):
-        """计算5日累计资金流"""
-        recent_5_days = fund_df.tail(5)
-        
-        result = {
-            '5日主力净流入额': recent_5_days['主力净流入-净额'].sum() if '主力净流入-净额' in recent_5_days.columns else 0,
-            '5日超大单净流入额': recent_5_days['超大单净流入-净额'].sum() if '超大单净流入-净额' in recent_5_days.columns else 0,
-            '5日大单净流入额': recent_5_days['大单净流入-净额'].sum() if '大单净流入-净额' in recent_5_days.columns else 0,
-            '5日中单净流入额': recent_5_days['中单净流入-净额'].sum() if '中单净流入-净额' in recent_5_days.columns else 0,
-            '5日小单净流入额': recent_5_days['小单净流入-净额'].sum() if '小单净流入-净额' in recent_5_days.columns else 0,
-        }
-        
-        # 计算5日平均占比
-        for col_name, avg_key in [
-            ('主力净流入-净占比', '5日主力净流入占比'),
-            ('超大单净流入-净占比', '5日超大单净流入占比'),
-            ('大单净流入-净占比', '5日大单净流入占比'),
-            ('中单净流入-净占比', '5日中单净流入占比'),
-            ('小单净流入-净占比', '5日小单净流入占比')
-        ]:
-            if col_name in recent_5_days.columns:
-                result[avg_key] = recent_5_days[col_name].mean()
-        
-        return result
-    
-    def _clean_fund_flow_data(self, fund_flow_data):
-        """清洗和格式化资金流数据"""
-        for key, value in fund_flow_data.items():
-            if key == '日期':  # 日期字段保持字符串
-                continue
-            try:
-                if isinstance(value, str):
-                    # 去除百分号并转换为数值
-                    if '%' in str(value):
-                        fund_flow_data[key] = float(str(value).replace('%', ''))
-                    else:
-                        fund_flow_data[key] = float(value) if value != '-' else 0.0
-                else:
-                    fund_flow_data[key] = float(value) if value is not None else 0.0
-            except (ValueError, TypeError):
-                fund_flow_data[key] = 0.0
-        
-        return fund_flow_data
-    
-    def _parse_basic_info(self, info_dict, stock_code):
-        """解析基本信息"""
-        return {
-            '股票代码': info_dict.get('代码', info_dict.get('股票代码', stock_code)),
-            '股票简称': info_dict.get('简称', info_dict.get('股票简称', '未知')),
-            '行业': info_dict.get('行业', info_dict.get('所属行业', '未知')),
-            '流通股本': self._safe_float_conversion(info_dict.get('流通股本', 0)),
-            '流通市值': self._safe_float_conversion(info_dict.get('流通市值', 0)),
-            '总股本': self._safe_float_conversion(info_dict.get('总股本', 0)),
-            '总市值': self._safe_float_conversion(info_dict.get('总市值', 0)),
-            '市盈率': info_dict.get('市盈率-动态', info_dict.get('市盈率', '未知')),
-            '市净率': info_dict.get('市净率', '未知')
-        }
-    
-    def _safe_float_conversion(self, value):
-        """安全的浮点数转换"""
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return 0.0
-    
-    def _format_market_values(self, stock_info):
-        """格式化市值数据（转换为亿为单位）"""
-        # 格式化数值（亿为单位）
-        for field, unit_field in [
-            ('流通市值', '流通市值_亿'),
-            ('总市值', '总市值_亿'),
-            ('流通股本', '流通股本_亿股'),
-            ('总股本', '总股本_亿股')
-        ]:
-            value = stock_info.get(field, 0)
-            if value > 0:
-                stock_info[unit_field] = value / 100000000
-            else:
-                stock_info[unit_field] = 0
-        
-        return stock_info
-    
-    def _get_default_basic_info(self, stock_code):
-        """获取默认基本信息"""
-        return {
-            '股票代码': stock_code,
-            '股票简称': "未知",
-            '行业': "未知",
-            '流通市值_亿': 0,
-            '总市值_亿': 0,
-            '流通股本_亿股': 0,
-            '总股本_亿股': 0,
-            '市盈率': "未知",
-            '市净率': "未知"
-        }
+            self.logger.warning(f"判断交易日失败：{str(e)}")
+            weekday = date_to_check.weekday()
+            is_trading = weekday < 5
+            self.logger.debug(f"使用备用方法检查 {date_to_check}: {'是交易日' if is_trading else '非交易日'}")
+            return is_trading

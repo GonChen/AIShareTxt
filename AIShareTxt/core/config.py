@@ -217,6 +217,14 @@ class IndicatorConfig:
         '3': 'sz'   # 深圳市场（创业板）
     }
     
+    # 数据源配置
+    DATA_SOURCE_CONFIG = {
+        'default_source': os.environ.get('DATA_SOURCE', 'akshare'),  # 可选: 'akshare', 'gm'
+        'gm': {
+            'token': os.environ.get('GM_TOKEN', ''),  # 掘金终端密钥
+        }
+    }
+
     # AI配置
     AI_CONFIG = {
         # 默认使用的AI提供商

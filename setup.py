@@ -66,6 +66,7 @@ setup(
     extras_require={
         "dev": dev_requires,
         "ai": ["openai>=1.0.0", "zhipuai>=2.0.0"],
+        "gm": ["gm>=3.0.0"],
     },
     entry_points={
         "console_scripts": [
