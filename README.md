@@ -3,7 +3,8 @@
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MulanPSL2-blue.svg)](LICENSE)
 
-**专业的股票数据处理与报告生成工具**
+**中国股票技术指标文本生成工具包**
+- [**AIShareTxt**](https://pypi.org/project/aishare-txt/) 用于为金融分析相关领域的AI智能体提供准确且全面的中国股票技术指标上下文服务。
 
 <a href="https://www.star-history.com/?repos=chaofanat%2FAIShareTxt&type=date&legend=top-left">
  <picture>
@@ -13,7 +14,7 @@
  </picture>
 </a>
 
-AIShareTxt是一个功能强大的Python股票数据处理工具包，提供全面的股票数据获取、技术指标处理、AI数据处理建议和详细数据报告生成功能。
+
 
 ## ✨ 主要功能
 
