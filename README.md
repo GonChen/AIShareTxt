@@ -5,6 +5,14 @@
 
 **专业的股票数据处理与报告生成工具**
 
+<a href="https://www.star-history.com/?repos=chaofanat%2FAIShareTxt&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=chaofanat/AIShareTxt&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=chaofanat/AIShareTxt&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=chaofanat/AIShareTxt&type=date&legend=top-left" />
+ </picture>
+</a>
+
 AIShareTxt是一个功能强大的Python股票数据处理工具包，提供全面的股票数据获取、技术指标处理、AI数据处理建议和详细数据报告生成功能。
 
 ## ✨ 主要功能
