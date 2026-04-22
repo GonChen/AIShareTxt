@@ -66,11 +66,14 @@ class ReportGenerator:
     
     def _generate_header(self, stock_code, indicators):
         """生成报告头部"""
+        source = indicators.get('data_source', 'akshare')
+        source_label = {'akshare': 'akshare', 'gm': '掘金量化终端'}.get(source, source)
         header = []
         header.append(self.config.REPORT_CONFIG['title_separator'])
         header.append(f"股票代码：{stock_code}")
         header.append(f"数据日期：{indicators.get('date', 'N/A')}")
         header.append(f"当前价格：{indicators.get('current_price', 0):.{self.config.DISPLAY_PRECISION['price']}f} 元")
+        header.append(f"数据来源：{source_label}")
         header.append(self.config.REPORT_CONFIG['title_separator'])
         return header
     

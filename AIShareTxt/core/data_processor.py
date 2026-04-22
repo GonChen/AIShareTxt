@@ -136,6 +136,9 @@ class StockDataProcessor:
             # 步骤5：生成报告
             self.logger.info("步骤5/5：生成数据报告...")
 
+            # 注入数据源标识
+            self.indicators['data_source'] = self.data_fetcher._used_source
+
             # 生成报告
             self.logger.info("生成数据报告...")
             report = self.report_generator.generate_report(
@@ -191,6 +194,7 @@ class StockDataProcessor:
                 return f"{self.config.ERROR_MESSAGES['calculation_failed']}"
             
             # 生成报告（不包含基本信息和资金流）
+            self.indicators['data_source'] = self.data_fetcher._used_source
             report = self.report_generator.generate_report(
                 stock_code,
                 self.indicators,

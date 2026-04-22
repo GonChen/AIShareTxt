@@ -27,6 +27,7 @@ class StockDataFetcher:
         # 初始化数据源
         self._akshare = AkshareDataSource()
         self._primary = self._akshare
+        self._used_source = 'akshare'
 
         source_name = self.config.DATA_SOURCE_CONFIG.get('default_source', 'akshare')
         if source_name == 'gm':
@@ -61,12 +62,14 @@ class StockDataFetcher:
 
         # 主数据源
         raw_data = self._primary.fetch_stock_data(stock_code, period, start_date, adjust)
+        self._used_source = self._primary.name
 
         # fallback 到 akshare
         if (raw_data is None or (isinstance(raw_data, pd.DataFrame) and len(raw_data) == 0)):
             if self._primary is not self._akshare:
                 self.logger.info("主数据源失败，fallback 到 akshare")
                 raw_data = self._akshare.fetch_stock_data(stock_code, period, start_date, adjust)
+                self._used_source = 'akshare'
 
         if raw_data is None or (isinstance(raw_data, pd.DataFrame) and len(raw_data) == 0):
             self.logger.error(f"所有数据源均获取失败：{stock_code}")

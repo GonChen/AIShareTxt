@@ -75,6 +75,9 @@ class GmDataSource(BaseDataSource):
 
             fields = 'eob,open,high,low,close,volume,money'
             today_str = datetime.now().strftime('%Y-%m-%d')
+            # 兼容 YYYYMMDD 和 YYYY-MM-DD 两种格式
+            if '-' not in start_date:
+                start_date = f'{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}'
             start_time = f'{start_date} 09:30:00'
             end_time = f'{today_str} 23:59:59'
 
