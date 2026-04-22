@@ -149,61 +149,69 @@ class GmDataSource(BaseDataSource):
     # ==================== 资金流 ====================
 
     def get_fund_flow_data(self, stock_code: str, target_date=None) -> dict:
-        """使用 gm stk_get_money_flow() 获取资金流数据"""
+        """使用 gm stk_get_money_flow() 获取资金流数据，含5日累计"""
         try:
             from gm.api import stk_get_money_flow
 
             gm_symbol = self._to_gm_symbol(stock_code)
             self.logger.info(f"[gm] 获取 {gm_symbol} 资金流数据...")
 
-            result = {}
-            if target_date is not None:
-                date_str = target_date.strftime('%Y-%m-%d') if hasattr(target_date, 'strftime') else str(target_date)
-                raw = stk_get_money_flow(symbols=gm_symbol, trade_date=date_str)
-            else:
-                raw = stk_get_money_flow(symbols=gm_symbol)
+            daily_rows = self._fetch_multi_day_fund_flow(
+                stk_get_money_flow, gm_symbol, target_date, days=5
+            )
 
-            if raw is None or raw.empty:
+            if not daily_rows:
                 self.logger.warning(f"[gm] 未获取到 {stock_code} 的资金流数据")
                 return {}
 
-            # 取目标行或最新行
-            if target_date is not None:
-                target_str = target_date.strftime('%Y-%m-%d') if hasattr(target_date, 'strftime') else str(target_date)
-                matched = raw[raw['trade_date'].astype(str).str[:10] == target_str]
-                if matched.empty:
-                    matched = raw.tail(1)
-                row = matched.iloc[0]
-            else:
-                row = raw.iloc[-1]
-
-            # 映射字段
+            row = daily_rows[0]
+            result = {}
             for gm_field, std_field in self.FUND_FLOW_MAP.items():
                 result[std_field] = row.get(gm_field, 0)
 
             date_val = row.get('trade_date', '')
             result['日期'] = str(date_val)[:10] if date_val else ''
 
-            # 5日累计
-            if len(raw) >= 5:
-                recent = raw.tail(5)
-                result['5日主力净流入额'] = recent['main_net_in'].sum() if 'main_net_in' in recent.columns else 0
-                result['5日超大单净流入额'] = recent['super_net_in'].sum() if 'super_net_in' in recent.columns else 0
-                result['5日大单净流入额'] = recent['large_net_in'].sum() if 'large_net_in' in recent.columns else 0
-                result['5日中单净流入额'] = recent['mid_net_in'].sum() if 'mid_net_in' in recent.columns else 0
-                result['5日小单净流入额'] = recent['small_net_in'].sum() if 'small_net_in' in recent.columns else 0
-                result['5日主力净流入占比'] = recent['main_net_in_rate'].mean() if 'main_net_in_rate' in recent.columns else 0
-                result['5日超大单净流入占比'] = recent['super_net_in_rate'].mean() if 'super_net_in_rate' in recent.columns else 0
-                result['5日大单净流入占比'] = recent['large_net_in_rate'].mean() if 'large_net_in_rate' in recent.columns else 0
-                result['5日中单净流入占比'] = recent['mid_net_in_rate'].mean() if 'mid_net_in_rate' in recent.columns else 0
-                result['5日小单净流入占比'] = recent['small_net_in_rate'].mean() if 'small_net_in_rate' in recent.columns else 0
+            if len(daily_rows) >= 5:
+                recent = pd.DataFrame(daily_rows)
+                result['5日主力净流入额'] = recent['main_net_in'].sum()
+                result['5日超大单净流入额'] = recent['super_net_in'].sum()
+                result['5日大单净流入额'] = recent['large_net_in'].sum()
+                result['5日中单净流入额'] = recent['mid_net_in'].sum()
+                result['5日小单净流入额'] = recent['small_net_in'].sum()
+                result['5日主力净流入占比'] = recent['main_net_in_rate'].mean()
+                result['5日超大单净流入占比'] = recent['super_net_in_rate'].mean()
+                result['5日大单净流入占比'] = recent['large_net_in_rate'].mean()
+                result['5日中单净流入占比'] = recent['mid_net_in_rate'].mean()
+                result['5日小单净流入占比'] = recent['small_net_in_rate'].mean()
 
-            self.logger.info("[gm] 资金流数据获取成功")
+            self.logger.info(f"[gm] 资金流数据获取成功（{len(daily_rows)}天）")
             return result
 
         except Exception as e:
             self.logger.warning(f"[gm] 获取资金流数据失败：{str(e)}")
             return {}
+
+    def _fetch_multi_day_fund_flow(self, api_func, gm_symbol: str, target_date, days: int = 5) -> list:
+        """逐天查询资金流数据，跳过非交易日"""
+        rows = []
+        check_date = target_date if target_date else datetime.now().date()
+        if hasattr(check_date, 'date') and not isinstance(check_date, date):
+            check_date = check_date.date()
+
+        for _ in range(days * 3):
+            if len(rows) >= days:
+                break
+            date_str = check_date.strftime('%Y-%m-%d')
+            try:
+                raw = api_func(symbols=gm_symbol, trade_date=date_str)
+                if raw is not None and not raw.empty:
+                    rows.append(raw.iloc[0].to_dict())
+            except Exception:
+                pass
+            check_date = check_date - timedelta(days=1)
+
+        return rows
 
     # ==================== 基本信息 ====================
 
