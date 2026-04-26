@@ -17,7 +17,8 @@ class GmDataSource(BaseDataSource):
         'low': 'low',
         'close': 'close',
         'volume': 'volume',
-        'money': 'turnover',
+        'amount': 'turnover',
+        'turn_rate': 'turnover_rate',
     }
 
     # gm 资金流字段 → 项目标准字段
@@ -73,7 +74,7 @@ class GmDataSource(BaseDataSource):
             gm_symbol = self._to_gm_symbol(stock_code)
             self.logger.info(f"[gm] 获取股票 {gm_symbol} 的数据（从 {start_date} 开始）...")
 
-            fields = 'eob,open,high,low,close,volume,money'
+            fields = 'eob,open,high,low,close,volume,amount'
             today_str = datetime.now().strftime('%Y-%m-%d')
             # 兼容 YYYYMMDD 和 YYYY-MM-DD 两种格式
             if '-' not in start_date:
@@ -93,6 +94,9 @@ class GmDataSource(BaseDataSource):
             if raw_data is None:
                 raw_data = pd.DataFrame()
 
+            # 补充换手率数据（history() 不提供，用 get_history_symbol 补取）
+            raw_data = self._enrich_turnover_rate(raw_data, gm_symbol, start_date, today_str)
+
             # 检查是否需要补全当天数据
             now = datetime.now()
             today = now.date()
@@ -110,6 +114,9 @@ class GmDataSource(BaseDataSource):
 
             # 映射列名
             raw_data = raw_data.rename(columns=self.COLUMN_MAP)
+
+            # 按日期去重：同一交易日保留 turnover 更完整的行
+            raw_data = self._deduplicate_by_date(raw_data)
 
             self.logger.info(f"[gm] 获取到 {len(raw_data)} 条数据")
             return raw_data
@@ -138,7 +145,7 @@ class GmDataSource(BaseDataSource):
                     row[field] = item.get('price', 0)
                 elif field == 'volume':
                     row[field] = item.get('cum_volume', 0)
-                elif field == 'money':
+                elif field == 'amount':
                     row[field] = item.get('cum_amount', 0)
                 else:
                     row[field] = item.get(field, 0)
@@ -148,6 +155,87 @@ class GmDataSource(BaseDataSource):
         except Exception as e:
             self.logger.debug(f"[gm] current() 获取当天数据失败：{str(e)}")
             return None
+
+    def _deduplicate_by_date(self, data: pd.DataFrame) -> pd.DataFrame:
+        """按日期去重，同一交易日优先保留字段更完整的行，然后回填缺失值"""
+        if data.empty or 'date' not in data.columns:
+            return data
+
+        data['_date_key'] = data['date'].apply(
+            lambda x: pd.Timestamp(x).date() if pd.notna(x) else None
+        )
+
+        dup_mask = data.duplicated(subset=['_date_key'], keep=False)
+        if not dup_mask.any():
+            data.drop(columns=['_date_key'], inplace=True)
+            return data
+
+        # 计算每行非NaN字段数作为完整度评分
+        check_cols = [c for c in ['turnover', 'turnover_rate'] if c in data.columns]
+        if check_cols:
+            data['_score'] = data[check_cols].notna().sum(axis=1)
+            result = data.sort_values('_score', na_position='first')
+            result = result.drop_duplicates(subset=['_date_key'], keep='last')
+            result = result.drop(columns=['_score'])
+        else:
+            result = data.drop_duplicates(subset=['_date_key'], keep='last')
+
+        # 用同日期其他行的有效值回填仍为NaN的字段
+        result = result.sort_values('date').reset_index(drop=True)
+        for col in check_cols:
+            if result[col].isna().any():
+                fill_map = data.dropna(subset=[col]).groupby('_date_key')[col].first()
+                mask = result[col].isna()
+                result.loc[mask, col] = result.loc[mask, '_date_key'].map(fill_map)
+
+        result = result.drop(columns=['_date_key'], errors='ignore')
+
+        removed = len(data) - len(result)
+        if removed > 0:
+            self.logger.info(f"[gm] 去重：移除了 {removed} 条重复日期数据")
+
+        return result
+
+    def _enrich_turnover_rate(self, data: pd.DataFrame, gm_symbol: str,
+                              start_date: str, end_date: str) -> pd.DataFrame:
+        """用 get_history_symbol() 补取换手率数据并合并"""
+        if data.empty:
+            return data
+
+        try:
+            from gm.api import get_history_symbol
+
+            hist = get_history_symbol(
+                symbol=gm_symbol,
+                start_date=start_date,
+                end_date=end_date,
+                df=True
+            )
+
+            if hist is None or hist.empty or 'trade_date' not in hist.columns:
+                self.logger.debug("[gm] get_history_symbol 未返回有效数据")
+                return data
+
+            # 构建日期→换手率映射
+            hist['trade_date'] = pd.to_datetime(hist['trade_date'])
+            turn_rate_map = dict(zip(
+                hist['trade_date'].dt.date,
+                hist['turn_rate']
+            ))
+
+            # 将换手率合并到主数据
+            data['turn_rate'] = data['eob'].apply(
+                lambda x: turn_rate_map.get(pd.Timestamp(x).date(), np.nan)
+                if pd.notna(x) else np.nan
+            )
+
+            valid_count = data['turn_rate'].notna().sum()
+            self.logger.info(f"[gm] 补取换手率数据：{valid_count}/{len(data)} 条有效")
+
+        except Exception as e:
+            self.logger.debug(f"[gm] 补取换手率数据失败：{str(e)}")
+
+        return data
 
     # ==================== 资金流 ====================
 
