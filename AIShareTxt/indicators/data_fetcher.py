@@ -78,8 +78,18 @@ class StockDataFetcher:
         return self._process_stock_data(raw_data, stock_code)
 
     def get_fund_flow_data(self, stock_code, target_date=None):
-        """获取主力资金流数据"""
+        """获取主力资金流数据，含日期一致性校验"""
         data = self._primary.get_fund_flow_data(stock_code, target_date)
+
+        # 校验返回数据的日期是否与请求日期一致
+        if data and target_date:
+            data_date = data.get('日期', '')
+            expected_date = target_date.strftime('%Y-%m-%d') if hasattr(target_date, 'strftime') else str(target_date)
+            if data_date != expected_date:
+                self.logger.warning(
+                    f"资金流数据日期不一致：请求 {expected_date}，返回 {data_date}，降级使用 akshare"
+                )
+                data = None
 
         if not data and self._primary is not self._akshare:
             self.logger.info("主数据源资金流失败，fallback 到 akshare")
